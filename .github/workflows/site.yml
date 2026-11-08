@@ -1,0 +1,52 @@
+# Builds and publishes vectors.v2fsupply.com: the website pages plus fresh winds-aloft files
+# from NOAA's GFS model. Runs after each GFS cycle is published (about 5 hours after 00/06/12/18Z),
+# on every push to main (website edits), and on demand.
+# If the winds step fails, nothing is deployed and the last good site (and winds) stays live.
+name: Build site and winds aloft
+
+on:
+  schedule:
+    - cron: "35 5,11,17,23 * * *"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: pip install eccodes numpy
+      - name: Winds aloft from NOAA GFS
+        run: python tools/gfs_winds.py site
+      - name: Website pages
+        run: |
+          cp index.html terms.html privacy.html site/
+          cp CNAME site/ 2>/dev/null || true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
