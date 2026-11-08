@@ -1,0 +1,127 @@
+# Hourly health check for Vectors' backends, with self-repair where possible.
+#  - Winds aloft files older than 13 h: re-runs the site/winds job.
+#  - NOTAM server: its 3-minute sync heals short outages by itself (it always asks for
+#    everything since its last good pull, up to 72 h). If the sync is over 48 h behind, or once a
+#    week to reconcile, this reloads the full NOTAM set (needs the four secrets below; never more
+#    than one bulk pull per 24 h).
+#  - Anything still wrong opens (or updates) a GitHub issue labelled "monitor", which emails the
+#    repo owner; the issue closes itself once everything is healthy again.
+# Secrets for the NOTAM reload (Settings > Secrets and variables > Actions):
+#   NMS_CLIENT_ID, NMS_CLIENT_SECRET, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+name: Monitor backends
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_reload:
+        description: "Reload all NOTAMs now (still limited to once per 24 h)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      HAS_SECRETS: ${{ secrets.NMS_CLIENT_ID != '' && secrets.CLOUDFLARE_API_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check NOTAM server and winds files
+        id: check
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, time, urllib.request
+          from datetime import datetime, timezone
+          ua = {'User-Agent': 'Vectors monitor (support@v2fsupply.com)'}
+          def get(url):
+              return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=ua), timeout=30))
+          def age(stamp):
+              return time.time() - datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp()
+          problems = []
+          notam_age = winds_age = None
+          try:
+              h = get('https://vectors-notams.v2fsupply.workers.dev/health')
+              notam_age = age(h['lastSync']) if h.get('lastSync') else 1e9
+              if notam_age > 15 * 60:
+                  err = (h.get('lastError') or {}).get('message', 'no error recorded')
+                  problems.append(f"NOTAM sync is {notam_age/3600:.1f} h behind (last error: {err})")
+          except Exception as e:
+              problems.append(f"NOTAM server unreachable: {e}")
+          try:
+              w = get('https://vectors.v2fsupply.com/winds/latest.json')
+              winds_age = time.time() - w['generated']
+              if winds_age > 13 * 3600:
+                  problems.append(f"Winds aloft files are {winds_age/3600:.1f} h old (run {w.get('run')})")
+          except Exception as e:
+              problems.append(f"Winds aloft index unreachable: {e}")
+          weekly = datetime.now(timezone.utc).weekday() == 6 and datetime.now(timezone.utc).hour == 10
+          print(f"notam_reload={'true' if (notam_age or 0) > 48 * 3600 or weekly else 'false'}")
+          print(f"winds_stale={'true' if winds_age is None or winds_age > 13 * 3600 else 'false'}")
+          print("problems=" + json.dumps(problems))
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - name: Self-repair winds (re-run the site job)
+        if: steps.check.outputs.winds_stale == 'true'
+        run: gh workflow run site.yml --ref main
+
+      - name: Reload NOTAMs
+        id: reload
+        if: (steps.check.outputs.notam_reload == 'true' || inputs.force_reload) && env.HAS_SECRETS == 'true'
+        env:
+          NMS_CLIENT_ID: ${{ secrets.NMS_CLIENT_ID }}
+          NMS_CLIENT_SECRET: ${{ secrets.NMS_CLIENT_SECRET }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set +e
+          python3 tools/notam_reload.py
+          code=$?
+          set -e
+          if [ $code -eq 3 ]; then echo "skipped (bulk pull limit)"; exit 0; fi
+          if [ $code -ne 0 ]; then exit $code; fi
+          npx --yes wrangler@4 d1 execute vectors-notams --remote --file reload.sql --config tools/wrangler.jsonc -y > /dev/null
+          echo "NOTAMs reloaded"
+
+      - name: Report
+        if: always()
+        env:
+          PROBLEMS: ${{ steps.check.outputs.problems }}
+          RELOAD_FAILED: ${{ steps.reload.outcome == 'failure' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          problems = json.loads(os.environ.get('PROBLEMS') or '[]')
+          if os.environ.get('RELOAD_FAILED') == 'true':
+              problems.append('The automatic NOTAM reload failed; see this run\'s log.')
+          run = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          sh = lambda *a: subprocess.run(a, capture_output=True, text=True)
+          sh('gh', 'label', 'create', 'monitor', '--color', 'D93F0B', '--description', 'Backend health alerts')
+          found = sh('gh', 'issue', 'list', '--label', 'monitor', '--state', 'open', '--json', 'number', '-q', '.[0].number').stdout.strip()
+          if problems:
+              body = 'The hourly check found:\n\n' + '\n'.join(f'- {p}' for p in problems) + f'\n\nRun: {run}'
+              if found:
+                  sh('gh', 'issue', 'comment', found, '--body', body)
+              else:
+                  sh('gh', 'issue', 'create', '--title', 'Vectors backend needs attention', '--label', 'monitor', '--body', body)
+              print('\n'.join(problems))
+          elif found:
+              sh('gh', 'issue', 'close', found, '--comment', f'All healthy again. {run}')
+              print('healthy; closed issue', found)
+          else:
+              print('healthy')
+          PY

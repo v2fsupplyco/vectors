@@ -1,0 +1,7 @@
+// Only used by the NOTAM reload workflow to reach the database by name.
+{
+  "name": "vectors-notams-reload",
+  "d1_databases": [
+    { "binding": "DB", "database_name": "vectors-notams", "database_id": "38a9a517-e28e-42dd-a2d2-2dc1376fd5b3" }
+  ]
+}
